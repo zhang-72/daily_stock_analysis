@@ -38,6 +38,7 @@ from sqlalchemy import (
     and_,
     delete,
     desc,
+    func,
 )
 from sqlalchemy.orm import (
     declarative_base,
@@ -176,6 +177,31 @@ class NewsIntel(Base):
 
     def __repr__(self) -> str:
         return f"<NewsIntel(code={self.code}, title={self.title[:20]}...)>"
+
+
+class FundamentalSnapshot(Base):
+    """
+    基本面上下文快照（P0 write-only）。
+
+    仅用于写入，主链路不依赖读取该表，便于后续回测/画像扩展。
+    """
+    __tablename__ = 'fundamental_snapshot'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_id = Column(String(64), nullable=False, index=True)
+    code = Column(String(10), nullable=False, index=True)
+    payload = Column(Text, nullable=False)
+    source_chain = Column(Text)
+    coverage = Column(Text)
+    created_at = Column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index('ix_fundamental_snapshot_query_code', 'query_id', 'code'),
+        Index('ix_fundamental_snapshot_created', 'created_at'),
+    )
+
+    def __repr__(self) -> str:
+        return f"<FundamentalSnapshot(query_id={self.query_id}, code={self.code})>"
 
 
 class AnalysisHistory(Base):
@@ -376,6 +402,22 @@ class ConversationMessage(Base):
     role = Column(String(20), nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
     created_at = Column(DateTime, default=datetime.now, index=True)
+
+
+class LLMUsage(Base):
+    """One row per litellm.completion() call — token-usage audit log."""
+
+    __tablename__ = 'llm_usage'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 'analysis' | 'agent' | 'market_review'
+    call_type = Column(String(32), nullable=False, index=True)
+    model = Column(String(128), nullable=False)
+    stock_code = Column(String(16), nullable=True)
+    prompt_tokens = Column(Integer, nullable=False, default=0)
+    completion_tokens = Column(Integer, nullable=False, default=0)
+    total_tokens = Column(Integer, nullable=False, default=0)
+    called_at = Column(DateTime, default=datetime.now, index=True)
 
 
 class DatabaseManager:
@@ -686,6 +728,43 @@ class DatabaseManager:
 
         return saved_count
 
+    def save_fundamental_snapshot(
+        self,
+        query_id: str,
+        code: str,
+        payload: Optional[Dict[str, Any]],
+        source_chain: Optional[Any] = None,
+        coverage: Optional[Any] = None,
+    ) -> int:
+        """
+        保存基本面快照（P0 write-only）。失败不抛异常，返回写入条数 0/1。
+        """
+        if not query_id or not code or payload is None:
+            return 0
+
+        with self.get_session() as session:
+            try:
+                session.add(
+                    FundamentalSnapshot(
+                        query_id=query_id,
+                        code=code,
+                        payload=self._safe_json_dumps(payload),
+                        source_chain=self._safe_json_dumps(source_chain or []),
+                        coverage=self._safe_json_dumps(coverage or {}),
+                    )
+                )
+                session.commit()
+                return 1
+            except Exception as e:
+                session.rollback()
+                logger.debug(
+                    "基本面快照写入失败（fail-open）: query_id=%s code=%s err=%s",
+                    query_id,
+                    code,
+                    e,
+                )
+                return 0
+
     def get_recent_news(self, code: str, days: int = 7, limit: int = 20) -> List[NewsIntel]:
         """
         获取指定股票最近 N 天的新闻情报
@@ -788,7 +867,8 @@ class DatabaseManager:
         code: Optional[str] = None,
         query_id: Optional[str] = None,
         days: int = 30,
-        limit: int = 50
+        limit: int = 50,
+        exclude_query_id: Optional[str] = None,
     ) -> List[AnalysisHistory]:
         """
         Query analysis history records.
@@ -796,6 +876,7 @@ class DatabaseManager:
         Notes:
         - If query_id is provided, perform exact lookup and ignore days window.
         - If query_id is not provided, apply days-based time filtering.
+        - exclude_query_id: exclude records with this query_id (for history comparison).
         """
         cutoff_date = datetime.now() - timedelta(days=days)
 
@@ -809,6 +890,10 @@ class DatabaseManager:
 
             if code:
                 conditions.append(AnalysisHistory.code == code)
+
+            # exclude_query_id only applies when not doing exact lookup (query_id is None)
+            if exclude_query_id and not query_id:
+                conditions.append(AnalysisHistory.query_id != exclude_query_id)
 
             results = session.execute(
                 select(AnalysisHistory)
@@ -891,6 +976,31 @@ class DatabaseManager:
                 select(AnalysisHistory).where(AnalysisHistory.id == record_id)
             ).scalars().first()
             return result
+
+    def delete_analysis_history_records(self, record_ids: List[int]) -> int:
+        """
+        删除指定的分析历史记录。
+
+        同时清理依赖这些历史记录的回测结果，避免外键约束失败。
+
+        Args:
+            record_ids: 要删除的历史记录主键 ID 列表
+
+        Returns:
+            实际删除的历史记录数量
+        """
+        ids = sorted({int(record_id) for record_id in record_ids if record_id is not None})
+        if not ids:
+            return 0
+
+        with self.session_scope() as session:
+            session.execute(
+                delete(BacktestResult).where(BacktestResult.analysis_history_id.in_(ids))
+            )
+            result = session.execute(
+                delete(AnalysisHistory).where(AnalysisHistory.id.in_(ids))
+            )
+            return result.rowcount or 0
 
     def get_latest_analysis_by_query_id(self, query_id: str) -> Optional[AnalysisHistory]:
         """
@@ -1455,11 +1565,120 @@ class DatabaseManager:
             )
             return result.rowcount
 
+    # ------------------------------------------------------------------
+    # LLM usage tracking
+    # ------------------------------------------------------------------
+
+    def record_llm_usage(
+        self,
+        call_type: str,
+        model: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        stock_code: Optional[str] = None,
+    ) -> None:
+        """Append one LLM call record to llm_usage."""
+        row = LLMUsage(
+            call_type=call_type,
+            model=model or "unknown",
+            stock_code=stock_code,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=total_tokens,
+        )
+        with self.session_scope() as session:
+            session.add(row)
+
+    def get_llm_usage_summary(
+        self,
+        from_dt: datetime,
+        to_dt: datetime,
+    ) -> Dict[str, Any]:
+        """Return aggregated token usage between from_dt and to_dt.
+
+        Returns a dict with keys:
+          total_calls, total_tokens,
+          by_call_type: list of {call_type, calls, total_tokens},
+          by_model:     list of {model, calls, total_tokens}
+        """
+        with self.session_scope() as session:
+            base_filter = and_(
+                LLMUsage.called_at >= from_dt,
+                LLMUsage.called_at <= to_dt,
+            )
+
+            # Overall totals
+            totals = session.execute(
+                select(
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                ).where(base_filter)
+            ).one()
+
+            # Breakdown by call_type
+            by_type_rows = session.execute(
+                select(
+                    LLMUsage.call_type,
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                )
+                .where(base_filter)
+                .group_by(LLMUsage.call_type)
+                .order_by(desc(func.sum(LLMUsage.total_tokens)))
+            ).all()
+
+            # Breakdown by model
+            by_model_rows = session.execute(
+                select(
+                    LLMUsage.model,
+                    func.count(LLMUsage.id).label("calls"),
+                    func.coalesce(func.sum(LLMUsage.total_tokens), 0).label("tokens"),
+                )
+                .where(base_filter)
+                .group_by(LLMUsage.model)
+                .order_by(desc(func.sum(LLMUsage.total_tokens)))
+            ).all()
+
+        return {
+            "total_calls": totals.calls,
+            "total_tokens": totals.tokens,
+            "by_call_type": [
+                {"call_type": r.call_type, "calls": r.calls, "total_tokens": r.tokens}
+                for r in by_type_rows
+            ],
+            "by_model": [
+                {"model": r.model, "calls": r.calls, "total_tokens": r.tokens}
+                for r in by_model_rows
+            ],
+        }
+
 
 # 便捷函数
 def get_db() -> DatabaseManager:
     """获取数据库管理器实例的快捷方式"""
     return DatabaseManager.get_instance()
+
+
+def persist_llm_usage(
+    usage: Dict[str, Any],
+    model: str,
+    call_type: str,
+    stock_code: Optional[str] = None,
+) -> None:
+    """Fire-and-forget: write one LLM call record to llm_usage. Never raises."""
+    try:
+        db = DatabaseManager.get_instance()
+        db.record_llm_usage(
+            call_type=call_type,
+            model=model,
+            prompt_tokens=usage.get("prompt_tokens", 0) or 0,
+            completion_tokens=usage.get("completion_tokens", 0) or 0,
+            total_tokens=usage.get("total_tokens", 0) or 0,
+            stock_code=stock_code,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning("[LLM usage] failed to persist usage record: %s", exc)
 
 
 if __name__ == "__main__":
